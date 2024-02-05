@@ -7,6 +7,9 @@ Original file is located at
     https://colab.research.google.com/drive/1FdlBrgUSoonWZR5JIhJ4dtRhUj2WUssT
 """
 
+!pip install mosek
+!pip install gurobipy
+
 # u, v, capacity, delay
 edges = [
     (0, 1, 10, 50), (1, 2, 15, 30), (2, 3, 10, 5), (3, 4, 20, 15),
@@ -23,7 +26,6 @@ key = tuple(sorted((1, 0)))
 link_capacity_map[key]
 
 import networkx as nx
-!pip install gurobipy
 def create_underlay_network(num_nodes, edges):
     # Create an empty graph
     underlay = nx.Graph()
@@ -379,67 +381,77 @@ if m.status == GRB.OPTIMAL:
 else:
     print('No optimal solution found')
 
-r
-
 import mosek
+import numpy as np
+from mosek.fusion import *
 
-# Function to define the optimization problem and solve it using MOSEK
-def optimize_with_mosek(B, J, Ea):
-    with mosek.Env() as env:
-        with env.Task(0, 0) as task:
-            # Assume `n` is the dimension of the square matrices involved
-            n = B.shape[0]
+# Problem data
+num_nodes = len(fully_connected_overlay.nodes()) # number of nodes (size of I and J) m in paper
+num_edges = len(fully_connected_overlay.edges()) # number of edges (size of alpha)
+edge_list = list(fully_connected_overlay.edges())
+# B = # define your incidence matrix here based on the network topology
+# Initialize the incidence matrix B with zeros
+B = np.zeros((num_nodes, num_edges))
 
-            # Assuming `alpha` is a vector that we want to optimize
-            num_vars = len(alpha)
-            task.appendvars(num_vars)
+# Populate the incidence matrix B
+# Here we use +1 for the 'from' node and -1 for the 'to' node to indicate the direction
+for k, (i, j) in enumerate(edge_list):
+    B[i, k] = 1   # 'from' node
+    B[j, k] = -1  # 'to' node
+B_fusion = Matrix.dense(B.tolist())
 
-            # Set the objective to minimize alpha (which is presumably related to rho)
-            # Here, we need the indices of alpha in the problem, which we assume are 0 to num_vars-1
-            task.putcfix(0.0)  # Set the fixed part of the objective.
-            for j in range(num_vars):
-                task.putcj(j, 1.0)  # Coefficient for variable j in the objective
+J = (1.0 / num_nodes) * np.ones((num_nodes, num_nodes))  # ideal mixing matrix mxm
+I = Matrix.eye(num_nodes)  # identity matrix mxm
 
-            # Add constraints for alpha_ij = 0 for all (i, j) not in Ea
-            # Here, you would need to define the indices properly based on Ea
-            for (i, j) in some_indices_not_in_Ea:
-                # Set alpha_ij to 0
-                task.putaij(i, j, 1.0)  # Add a constraint matrix coefficient at position (i, j)
-                task.putconbound(i, mosek.boundkey.fx, 0.0, 0.0)  # Fix alpha_ij to 0
+# Indices for activated links
+activated_indices = [(i, j) for i, j in activated_links]
 
-            # Define the matrix inequality constraint -rho*I <= I - B*diag(alpha)*B^T - J <= rho*I
-            # This part would require setting up semidefinite cones and matrix variables in MOSEK
-            # Since this is quite involved and requires the specifics of the matrices, it is left as a placeholder
+# Create a model
+with Model("LinkWeightOptimization") as M:
+    # Variable for tilde_rho
+    rho_tilde = M.variable("rho_tilde", 1, Domain.unbounded())
 
-            # Assume a function to set up the semidefinite constraint exists
-            setup_sdp_constraint(task, B, J)
+    # Variable for link weights, constrained by activated links
+    diag_matrix = M.variable('diag_matrix', [num_edges, num_edges], Domain.inRange(0.0, 1.0))
 
-            # Input the problem data into the task
-            # (This step is where you would populate the task with the actual data of your problem)
+    # Constraint 1: Non-diagonal elements of diag_matrix should be set to zero
+    for i in range(num_edges):
+        for j in range(num_edges):
+            if i != j:
+                M.constraint(Expr.sub(diag_matrix.index(i, j), 0.0), Domain.equalsTo(0.0))
 
-            # Solve the problem
-            task.optimize()
+    # Constraint: the diagonal elements of diag_matrix, diag_matrix[i][i], if i is not in activated_links then diag_matrix[i][i] should be set to zero
+    activated_indices_flat = [edge_list.index(pair) for pair in activated_indices]  # Get indices in the flat list
+    for i in range(num_edges):
+        if i not in activated_indices_flat:
+            M.constraint(Expr.sub(diag_matrix.index(i, i), 0.0), Domain.equalsTo(0.0))
 
-            # Extract the solution
-            xx = [0.] * num_vars
-            task.getxx(mosek.soltype.itr, xx)
+    print(activated_indices_flat, activated_indices)
+    # Constraint: -rho_tilde * I <= I - B * diag_matrix * B^T - J <= rho_tilde * I
+    B_diag_Bt = Expr.mul(B_fusion, Expr.mul(diag_matrix, B_fusion.transpose()))  # B * diag_matrix * B^T
+    big_part = Expr.sub(Expr.sub(I, B_diag_Bt), J)
 
-            # The variable xx contains the solution
-            return xx
 
-# Placeholder function for setting up the semidefinite constraint
-# You would need to replace this with actual implementation
-def setup_sdp_constraint(task, B, J):
-    pass
+    # Add constraint for diagonal elements of big_part to be less than or equal to rho_tilde I - B*diag_matrix*B^T - J <= rho_tilde * I
+    for i in range(num_nodes):
+        # Extracting the diagonal element of big_part matrix at [i, i]
+        big_part_diag_i = big_part.index([i, i])
+        # Adding the constraint that this diagonal element should be less than or equal to rho_tilde
+        M.constraint(Expr.sub(big_part_diag_i, rho_tilde), Domain.lessThan(0.0))
+        M.constraint(Expr.add(big_part_diag_i, rho_tilde), Domain.greaterThan(0.0))
 
-# Example usage:
-# Define your matrices B, J, and the set Ea accordingly
-B = ...
-J = ...
-Ea = ...
+    # Objective: Minimize rho_tilde
+    M.objective("obj", ObjectiveSense.Minimize, rho_tilde)
 
-# Solve the optimization problem
-alpha_optimal = optimize_with_mosek(B, J, Ea)
+    # Solve the problem
+    M.solve()
+
+    # Get the solution
+    optimal_rho_tilde = rho_tilde.level()
+    optimal_alpha = diag_matrix.level()
+
+    print("Optimal rho_tilde:", optimal_rho_tilde)
+    print("Optimal alpha:", optimal_alpha)
 
 """**Prim** **algorithm**"""
 
