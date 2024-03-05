@@ -49,13 +49,14 @@ loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 # Example of tracking accuracy
 lost_hitory = []
 val_accuracies = []
-
 # Custom training loop
 for epoch in range(epochs):
     print(f"Epoch {epoch+1}/{epochs}")
+    # Reset epoch loss for each agent
+    epoch_loss = [0] * num_agents
     # Shuffle and batch the data
     dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train)).shuffle(10000).batch(batch_size)
-
+    val_dataset = tf.data.Dataset.from_tensor_slices((x_val, y_val)).shuffle(2000).batch(batch_size)
     for step, (x_batch, y_batch) in enumerate(dataset):
         for i in range(num_agents):
             # Aggregation of parameters based on W
@@ -69,6 +70,8 @@ for epoch in range(epochs):
                 # Compute loss using the original parameters
                 predictions = agents_models[i](x_batch, training=True)
                 loss = loss_fn(y_batch, predictions)
+            # Update epoch loss for agent i
+            epoch_loss[i] += loss.numpy()
             # Compute gradients with respect to the original parameters
             grads = tape.gradient(loss, agents_models[i].trainable_variables)
 
@@ -80,6 +83,46 @@ for epoch in range(epochs):
 
             if step % 100 == 0:
                 print(f"Step {step}: Loss = {loss.numpy()}")
+    lost_hitory.append(sum(epoch_loss)/len(epoch_loss))
+    print(f"Epoch {epoch+1}, global objective loss: {sum(epoch_loss)/len(epoch_loss)}")
+    # Validation step at the end of each epoch
+    total_correct = 0
+    total_val_samples = 0
+    for x_batch_val, y_batch_val in val_dataset:
+        val_predictions = [agents_models[i](x_batch_val, training=False) for i in range(num_agents)]
+        # Assuming a strategy to aggregate predictions from all agents, e.g., averaging
+        avg_predictions = tf.reduce_mean(val_predictions, axis=0)
+        correct_preds = tf.equal(tf.argmax(avg_predictions, axis=1, output_type=tf.int32), y_batch_val)
+        total_correct += tf.reduce_sum(tf.cast(correct_preds, tf.float32))
+        total_val_samples += x_batch_val.shape[0]
+    val_accuracy = total_correct / total_val_samples
+    val_accuracies.append(val_accuracy)
+    print(f"Epoch {epoch+1}, Validation Accuracy: {val_accuracy.numpy()}")
+
+import matplotlib.pyplot as plt
+
+epochs = range(1, len(lost_hitory) + 1)
+
+plt.figure(figsize=(10, 5))
+
+# Plotting loss history
+plt.subplot(1, 2, 1)
+plt.plot(epochs, lost_hitory, label='Loss')
+plt.title('Global Average Loss over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+# Plotting validation accuracy
+plt.subplot(1, 2, 2)
+plt.plot(epochs, val_accuracies, label='Validation Accuracy', color='orange')
+plt.title('Validation Accuracy over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
 
 def evaluate_model(model, dataset):
     """
